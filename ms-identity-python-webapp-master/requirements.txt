@@ -1,0 +1,8 @@
+# Flask 2.2 does not work on Python 3.14 (pkgutil.get_loader was removed)
+Flask>=3
+# Flask 3 requires Flask-Session 0.8+
+Flask-Session>=0.8
+werkzeug>=2
+requests>=2,<3
+identity>=0.2,<0.3
+python-dotenv<0.22
