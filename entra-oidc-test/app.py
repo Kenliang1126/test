@@ -29,7 +29,7 @@ import secrets
 import jwt
 import requests
 from flask import Flask, redirect, request, session
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import config
 
@@ -95,7 +95,7 @@ __BODY__
 
 
 def page(body: str) -> str:
-    mode = "Client Secret" if config.CLIENT_SECRET else "PKCE"
+    mode = "Client Secret + PKCE" if config.CLIENT_SECRET else "PKCE"
     return (
         BASE.replace("__MODE__", mode)
         .replace("__ISSUER__", html.escape(AUTHORITY))
@@ -152,6 +152,42 @@ def explain_token_error(tokens: dict) -> str:
     return ""
 
 
+def tls_verify():
+    """requests 的 verify 参数: 配了公司根证书就用它, 否则用默认证书库。"""
+    return config.CA_BUNDLE.strip() or True
+
+
+def proxies():
+    """requests 的 proxies 参数; 未配置时返回 None, 由 requests 读取环境变量。"""
+    raw = config.PROXY.strip()
+    if not raw:
+        return None
+    return {"http": raw, "https": raw}
+
+
+def _mask_url(url: str) -> str:
+    """隐藏 URL 中的用户名/密码, 用于页面展示。"""
+    parts = urlsplit(url)
+    if parts.username or parts.password:
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        parts = parts._replace(netloc=f"***@{host}")
+    return urlunsplit(parts)
+
+
+def proxy_display() -> str:
+    """页面展示用的代理描述。"""
+    raw = config.PROXY.strip()
+    if raw:
+        return _mask_url(raw)
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return f"{_mask_url(value)} (来自环境变量 {key})"
+    return "未配置(直连)"
+
+
 def new_pkce_pair():
     verifier = secrets.token_urlsafe(48)
     challenge = (
@@ -169,7 +205,9 @@ def verify_id_token(id_token: str):
     if not issuer.startswith(("https://login.microsoftonline.com/", "https://sts.windows.net/")):
         raise ValueError(f"id_token 的 issuer 不是 Microsoft: {issuer}")
 
-    jwks = requests.get(JWKS_URL, timeout=30).json()
+    jwks = requests.get(
+        JWKS_URL, timeout=30, verify=tls_verify(), proxies=proxies()
+    ).json()
     header = jwt.get_unverified_header(id_token)
     key_data = next((k for k in jwks.get("keys", []) if k.get("kid") == header.get("kid")), None)
     if key_data is None:
@@ -222,7 +260,8 @@ def index():
     <tr><td>租户 TENANT_ID</td><td><code>{html.escape(config.TENANT_ID or "(未配置)")}</code></td></tr>
     <tr><td>客户端 ID</td><td><code>{html.escape(config.CLIENT_ID or "(未配置)")}</code></td></tr>
     <tr><td>回调地址</td><td><code>{html.escape(config.REDIRECT_URI)}</code></td></tr>
-    <tr><td>认证方式</td><td>{"客户端密码" if config.CLIENT_SECRET else "PKCE(无客户端密码)"}</td></tr>
+    <tr><td>认证方式</td><td>{"客户端密码 + PKCE" if config.CLIENT_SECRET else "PKCE(公共客户端, 无密码)"}</td></tr>
+    <tr><td>出站代理</td><td><code>{html.escape(proxy_display())}</code></td></tr>
     <tr><td>Scope</td><td><code>{SCOPE}</code></td></tr>
   </table>
   {warning}
@@ -251,10 +290,10 @@ def login():
         "state": session["state"],
         "nonce": session["nonce"],
         "prompt": "select_account",
+        # PKCE 与客户端类型无关, 始终发送
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
     }
-    if not config.CLIENT_SECRET:
-        params["code_challenge"] = challenge
-        params["code_challenge_method"] = "S256"
 
     return redirect(f"{AUTHORIZE_URL}?{urlencode(params)}")
 
@@ -319,13 +358,41 @@ def callback():
         "redirect_uri": config.REDIRECT_URI,
         "scope": SCOPE,
     }
+    # PKCE 的 code_verifier 始终发送; 机密客户端再额外附带 client_secret
+    payload["code_verifier"] = session.get("verifier", "")
     if config.CLIENT_SECRET:
         payload["client_secret"] = config.CLIENT_SECRET
-    else:
-        payload["code_verifier"] = session.get("verifier", "")
 
     try:
-        resp = requests.post(TOKEN_URL, data=payload, timeout=30)
+        resp = requests.post(
+            TOKEN_URL, data=payload, timeout=30, verify=tls_verify(), proxies=proxies()
+        )
+    except requests.exceptions.SSLError as exc:
+        steps.append(
+            (
+                "调用 /token 换取令牌",
+                False,
+                "TLS 证书校验失败: 找不到可信任的根证书。\n"
+                "公司网络很可能对 HTTPS 做了检查(中间人代理)。\n"
+                "处理: 向 IT 索取公司根证书, 转成 PEM 后把绝对路径填到 config.py 的 CA_BUNDLE, "
+                "然后重启本工具。\n\n"
+                f"原始错误: {exc}",
+            )
+        )
+        return page(f'<div class="card">{steps_html(steps)}</div>')
+    except requests.exceptions.ProxyError as exc:
+        steps.append(
+            (
+                "调用 /token 换取令牌",
+                False,
+                "无法经由公司代理访问 login.microsoftonline.com。\n"
+                "检查 config.py 的 PROXY: 格式应为 http://主机:端口, 需要认证时写成 "
+                "http://用户名:密码@主机:端口(密码里的 @ : / 需 URL 编码)。\n"
+                "也可以留空, 改用环境变量 HTTPS_PROXY。\n\n"
+                f"原始错误: {exc}",
+            )
+        )
+        return page(f'<div class="card">{steps_html(steps)}</div>')
     except requests.RequestException as exc:
         steps.append(("调用 /token 换取令牌", False, f"网络错误: {exc}"))
         return page(f'<div class="card">{steps_html(steps)}</div>')
