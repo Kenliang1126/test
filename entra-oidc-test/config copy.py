@@ -19,3 +19,17 @@ PORT = 5000
 # Flask session 密钥(保存 state/nonce/PKCE verifier)。
 # 留空则使用内置的本地测试用固定值; 仅本地使用无需修改。
 SECRET_KEY = ""
+
+# 公司出站代理。访问 login.microsoftonline.com 必须经过代理时填写。
+# 形如 "http://proxy.corp.example.com:8080"
+# 需要认证时 "http://user:password@proxy.corp.example.com:8080"
+# (密码里的 @ : / 等字符要做 URL 编码, 例如 @ -> %40)
+# 留空则沿用环境变量 HTTPS_PROXY / HTTP_PROXY; 都没有就直连。
+PROXY = ""
+
+# 公司网络的 HTTPS 检查(中间人代理)会让 Python 报
+#   SSLCertVerificationError: unable to get local issuer certificate
+# 把公司根证书的 PEM 文件路径填在这里(绝对路径); 留空则只用默认证书库。
+# 有多个根证书时, 用 cat 合并成一个 .pem 再填该文件路径。
+# 示例: CA_BUNDLE = "/etc/ssl/certs/company-root.pem"
+CA_BUNDLE = ""
